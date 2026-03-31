@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  run-provisioning.ps1 — Orquestrador principal (SEM FEATURES) com gate de pré-check.
+  run-provisioning.ps1 — Orquestrador principal (SEM FEATURES) com gate de pré-check e modo diagnóstico.
 
 .DESCRIPTION
   Estrutura esperada do repositório:
@@ -17,9 +17,9 @@
     2) steps\apps-install.ps1        (winget + config.json)
     3) steps\validation\full-validation.ps1
 
-  - Auto-elevação para Administrador
-  - Execução sequencial (um após o outro)
-  - Não fecha automaticamente
+  Melhorias:
+    - Captura stdout/stderr de cada step em arquivos (para não perder o erro)
+    - Não fecha automaticamente em falha: oferece menu de diagnóstico
 #>
 
 # ============================
@@ -54,6 +54,9 @@ $ValDir    = Join-Path $StepsDir "validation"
 $LogsDir = "C:\Logs\setup"
 if (-not (Test-Path $LogsDir)) { New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null }
 
+$StepLogDir = Join-Path $LogsDir "run-provisioning-steps"
+if (-not (Test-Path $StepLogDir)) { New-Item -ItemType Directory -Path $StepLogDir -Force | Out-Null }
+
 $PreCheckScript = Join-Path $ChecksDir "Test-Environment.ps1"
 $PreCheckLog    = Join-Path $LogsDir "Test-Environment.log"
 $ValidationLog  = Join-Path $LogsDir "07-full-validation.log"
@@ -62,16 +65,16 @@ $ValidationLog  = Join-Path $LogsDir "07-full-validation.log"
 # PIPELINE (SEM FEATURES)
 # ============================
 $Pipeline = @(
-  @{ Name="Drivers";   Path=(Join-Path $StepsDir "drivers.ps1") },
-  @{ Name="Apps";      Path=(Join-Path $StepsDir "apps-install.ps1") },
-  @{ Name="Validation";Path=(Join-Path $ValDir  "full-validation.ps1") }
+  @{ Name="Drivers";    Path=(Join-Path $StepsDir "drivers.ps1") },
+  @{ Name="Apps";       Path=(Join-Path $StepsDir "apps-install.ps1") },
+  @{ Name="Validation"; Path=(Join-Path $ValDir  "full-validation.ps1") }
 )
 
 # ============================
 # HELPERS UX
 # ============================
 function Read-KeyUpper {
-  # Retorna uma string em UpperInvariant a partir de ReadKey().Character
+  # Corrige o problema: Character é System.Char (sem .ToUpper()) — converte para string primeiro
   return $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Character.ToString().ToUpperInvariant()
 }
 
@@ -117,8 +120,44 @@ function Show-FullValidationLog {
   Write-Host ""
 }
 
+function Show-StepLogs {
+  param([string]$StepName)
+  $safe = ($StepName -replace '[^a-zA-Z0-9_-]', '_')
+  $outFile = Join-Path $StepLogDir "$safe.stdout.log"
+  $errFile = Join-Path $StepLogDir "$safe.stderr.log"
+
+  Write-Host ""
+  Write-Host "=== LOGS DO STEP: $StepName ===" -ForegroundColor Cyan
+  Write-Host "STDOUT: $outFile"
+  Write-Host "STDERR: $errFile"
+  Write-Host ""
+
+  if (Test-Path $outFile) {
+    Write-Host "--- STDOUT ---" -ForegroundColor DarkGray
+    Get-Content $outFile | ForEach-Object { Write-Host $_ }
+  } else {
+    Write-Host "(STDOUT não encontrado)" -ForegroundColor Yellow
+  }
+
+  Write-Host ""
+  if (Test-Path $errFile) {
+    Write-Host "--- STDERR ---" -ForegroundColor DarkGray
+    Get-Content $errFile | ForEach-Object {
+      if ($_ -match "error|falha|exception|denied|negado|blocked|policy|applocker|wdac|access" ) {
+        Write-Host $_ -ForegroundColor Red
+      } else {
+        Write-Host $_ -ForegroundColor Yellow
+      }
+    }
+  } else {
+    Write-Host "(STDERR não encontrado)" -ForegroundColor Yellow
+  }
+
+  Write-Host ""
+}
+
 # ============================
-# EXECUÇÃO CONTROLADA DE UM STEP
+# EXECUÇÃO CONTROLADA DE UM STEP (com captura STDOUT/STDERR)
 # ============================
 function Invoke-Step {
   param(
@@ -126,22 +165,31 @@ function Invoke-Step {
     [Parameter(Mandatory)][string]$Path
   )
 
+  $safe = ($Name -replace '[^a-zA-Z0-9_-]', '_')
+  $outFile = Join-Path $StepLogDir "$safe.stdout.log"
+  $errFile = Join-Path $StepLogDir "$safe.stderr.log"
+
   Write-Host ""
   Write-Host "===============================================" -ForegroundColor DarkGray
   Write-Host "Executando: $Name" -ForegroundColor Cyan
   Write-Host "Arquivo:    $Path"
+  Write-Host "STDOUT:     $outFile"
+  Write-Host "STDERR:     $errFile"
   Write-Host "===============================================" -ForegroundColor DarkGray
 
   if (-not (Test-Path $Path)) {
-    Write-Host "ERRO: Script não encontrado: $Path" -ForegroundColor Red
+    Set-Content -Path $errFile -Value "Script não encontrado: $Path" -Encoding UTF8 -Force
     return 2
   }
 
+  # Start-Process não captura stdout/stderr por padrão; redirecionamos para arquivos. [1](https://gist.github.com/peteristhegreat/b48da772167f86f43decbd34edbd0849)
   $p = Start-Process -FilePath "powershell.exe" -ArgumentList @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$Path`""
-  ) -Wait -PassThru -NoNewWindow
+  ) -Wait -PassThru -NoNewWindow `
+    -RedirectStandardOutput $outFile `
+    -RedirectStandardError  $errFile
 
   return $p.ExitCode
 }
@@ -192,7 +240,7 @@ function PreCheck-Gate {
     Write-Host $k
 
     switch ($k) {
-      "C" { return }  # libera pipeline
+      "C" { return }
       "R" { $code = Run-PreCheck; continue }
       "O" { Open-LogsFolder; continue }
       "N" { Open-PreCheckLogNotepad; continue }
@@ -203,7 +251,43 @@ function PreCheck-Gate {
 }
 
 # ============================
-# FINAL: MENU INTERATIVO
+# MENU DIAGNÓSTICO EM FALHA DE STEP
+# ============================
+function Failure-DiagnosticsMenu {
+  param(
+    [Parameter(Mandatory)][string]$StepName,
+    [Parameter(Mandatory)][int]$ExitCode
+  )
+
+  while ($true) {
+    Write-Host ""
+    Write-Host "===============================================" -ForegroundColor Red
+    Write-Host "FALHA NA ETAPA: $StepName (ExitCode=$ExitCode)" -ForegroundColor Red
+    Write-Host "===============================================" -ForegroundColor Red
+    Write-Host "Logs do step: $StepLogDir" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  [S] Mostrar STDOUT/STDERR deste step aqui"
+    Write-Host "  [O] Abrir pasta de logs no Explorer"
+    Write-Host "  [C] Continuar mesmo assim (não recomendado)"
+    Write-Host "  [Q] Sair"
+    Write-Host ""
+    Write-Host "Escolha (S/O/C/Q): " -NoNewline
+
+    $k = Read-KeyUpper
+    Write-Host $k
+
+    switch ($k) {
+      "S" { Show-StepLogs -StepName $StepName; continue }
+      "O" { Start-Process explorer.exe $StepLogDir | Out-Null; continue }
+      "C" { return $true }   # continuar
+      "Q" { return $false }  # sair
+      default { Write-Host "Opção inválida. Use S, O, C ou Q." -ForegroundColor Yellow }
+    }
+  }
+}
+
+# ============================
+# MENU FINAL (NÃO FECHA)
 # ============================
 function Final-Menu {
   while ($true) {
@@ -211,9 +295,10 @@ function Final-Menu {
     Write-Host "AÇÕES DISPONÍVEIS" -ForegroundColor Green
     Write-Host "  [R] Rodar novamente: full-validation.ps1"
     Write-Host "  [L] Recarregar/exibir novamente o log"
+    Write-Host "  [O] Abrir pasta C:\Logs\setup"
     Write-Host "  [Q] Sair"
     Write-Host "===============================================" -ForegroundColor DarkGray
-    Write-Host "Escolha (R/L/Q): " -NoNewline
+    Write-Host "Escolha (R/L/O/Q): " -NoNewline
 
     $k = Read-KeyUpper
     Write-Host $k
@@ -227,11 +312,12 @@ function Final-Menu {
         Show-FullValidationLog
       }
       "L" { Show-FullValidationLog }
+      "O" { Open-LogsFolder }
       "Q" {
         Write-Host "Encerrando por solicitação do usuário." -ForegroundColor Green
         break
       }
-      default { Write-Host "Opção inválida. Use R, L ou Q." -ForegroundColor Yellow }
+      default { Write-Host "Opção inválida. Use R, L, O ou Q." -ForegroundColor Yellow }
     }
   }
 }
@@ -252,11 +338,16 @@ $finalExitCode = 0
 
 foreach ($step in $Pipeline) {
   $code = Invoke-Step -Name $step.Name -Path $step.Path
+
   if ($code -ne 0) {
-    Write-Host ""
-    Write-Host "Falha na etapa '$($step.Name)' (ExitCode=$code). Pipeline interrompida." -ForegroundColor Red
     $finalExitCode = $code
-    break
+
+    # entra em modo diagnóstico e só segue se o usuário escolher continuar
+    $shouldContinue = Failure-DiagnosticsMenu -StepName $step.Name -ExitCode $code
+    if (-not $shouldContinue) {
+      Write-Host "Saindo por solicitação do usuário após falha." -ForegroundColor Yellow
+      break
+    }
   }
 }
 
